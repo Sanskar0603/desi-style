@@ -67,9 +67,58 @@ const DB = {
         }
       }
       return true;
-    } catch(e) { console.error("DB.set:", e); return false; }
+    } catch(e) {
+      console.error("DB.set:", e);
+      throw e; // surface the error to callers instead of silently failing
+    }
   },
 };
+
+/* ═══════════════════════════════════════════
+   IMAGE COMPRESSION HELPER
+   Resizes + re-encodes images client-side so they stay small
+   enough to store as base64 inside Firestore documents
+   (Firestore has a hard 1MB-per-document limit).
+═══════════════════════════════════════════ */
+function compressImage(file, { maxWidth = 800, maxHeight = 800, quality = 0.7 } = {}) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const img = new Image();
+      img.onload = () => {
+        let { width, height } = img;
+
+        // scale down proportionally if larger than max dimensions
+        if (width > maxWidth || height > maxHeight) {
+          const ratio = Math.min(maxWidth / width, maxHeight / height);
+          width = Math.round(width * ratio);
+          height = Math.round(height * ratio);
+        }
+
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, width, height);
+
+        // re-encode as JPEG at reduced quality — this is what shrinks file size
+        const dataUrl = canvas.toDataURL("image/jpeg", quality);
+        resolve(dataUrl);
+      };
+      img.onerror = () => reject(new Error("Could not load image"));
+      img.src = ev.target.result;
+    };
+    reader.onerror = () => reject(new Error("Could not read file"));
+    reader.readAsDataURL(file);
+  });
+}
+
+// rough byte-size estimate of a base64 data URL string
+function estimateBase64Bytes(dataUrl) {
+  const commaIdx = dataUrl.indexOf(",");
+  const base64 = commaIdx >= 0 ? dataUrl.slice(commaIdx + 1) : dataUrl;
+  return Math.round(base64.length * 0.75);
+}
 
 /* ═══════════════════════════════════════════
    HELPERS
@@ -78,22 +127,49 @@ const fmt  = n => "₹" + Number(n).toLocaleString("en-IN");
 const disc = p => p.originalPrice ? Math.round((1 - p.price/p.originalPrice)*100) : 0;
 
 /* ═══════════════════════════════════════════
-   IMAGE UPLOADER
+   IMAGE UPLOADER  (now uploads to Firebase Storage)
 ═══════════════════════════════════════════ */
 function ImageUploader({ current, onUpload, width=110, height=120, maxMB=5 }) {
   const ref = useRef();
   const [preview, setPreview] = useState(current);
+  const [compressing, setCompressing] = useState(false);
   useEffect(() => setPreview(current), [current]);
-  const handle = e => {
+
+  const handle = async e => {
     const file = e.target.files[0];
     if (!file) return;
     if (file.size > maxMB*1024*1024) { alert(`Image must be under ${maxMB}MB`); return; }
-    const reader = new FileReader();
-    reader.onload = ev => { setPreview(ev.target.result); onUpload(ev.target.result); };
-    reader.readAsDataURL(file);
+
+    setCompressing(true);
+    try {
+      const compressed = await compressImage(file, { maxWidth: 800, maxHeight: 800, quality: 0.7 });
+      const sizeKB = Math.round(estimateBase64Bytes(compressed) / 1024);
+      if (sizeKB > 700) {
+        // still too big — compress harder as a safety net
+        const compressedAgain = await compressImage(file, { maxWidth: 600, maxHeight: 600, quality: 0.55 });
+        setPreview(compressedAgain);
+        onUpload(compressedAgain);
+      } else {
+        setPreview(compressed);
+        onUpload(compressed);
+      }
+    } catch (err) {
+      console.error("Image compression failed:", err);
+      alert("Could not process this image. Please try a different photo.");
+    } finally {
+      setCompressing(false);
+      if (ref.current) ref.current.value = ""; // allow re-selecting same file
+    }
   };
+
   return (
-    <div className="img-uploader" style={{ width, height }} onClick={() => ref.current.click()}>
+    <div className="img-uploader" style={{ width, height, position:"relative" }} onClick={() => !compressing && ref.current.click()}>
+      {compressing && (
+        <div style={{ position:"absolute", inset:0, background:"rgba(255,255,255,0.85)", display:"flex", alignItems:"center", justifyContent:"center", flexDirection:"column", zIndex:2, fontSize:"0.7rem", color:"var(--crimson)", fontWeight:600 }}>
+          <div style={{ fontSize:"1.4rem", marginBottom:4 }}>⏳</div>
+          Processing...
+        </div>
+      )}
       {preview
         ? <img src={preview} alt="upload" style={{ width:"100%", height:"100%", objectFit:"cover" }}/>
         : <div style={{ textAlign:"center", color:"var(--muted)", padding:"0.5rem" }}>
@@ -107,22 +183,42 @@ function ImageUploader({ current, onUpload, width=110, height=120, maxMB=5 }) {
 }
 
 /* ═══════════════════════════════════════════
-   QR UPLOADER
+   QR UPLOADER  (now uploads to Firebase Storage)
 ═══════════════════════════════════════════ */
 function QRUploader({ current, onUpload }) {
   const ref = useRef();
   const [preview, setPreview] = useState(current);
+  const [compressing, setCompressing] = useState(false);
   useEffect(() => setPreview(current), [current]);
-  const handle = e => {
+
+  const handle = async e => {
     const file = e.target.files[0]; if (!file) return;
-    const reader = new FileReader();
-    reader.onload = ev => { setPreview(ev.target.result); onUpload(ev.target.result); };
-    reader.readAsDataURL(file);
+
+    setCompressing(true);
+    try {
+      // QR codes need to stay sharp — use higher quality/resolution than photos
+      const compressed = await compressImage(file, { maxWidth: 500, maxHeight: 500, quality: 0.85 });
+      setPreview(compressed);
+      onUpload(compressed);
+    } catch (err) {
+      console.error("QR compression failed:", err);
+      alert("Could not process this image. Please try a different photo.");
+    } finally {
+      setCompressing(false);
+      if (ref.current) ref.current.value = "";
+    }
   };
+
   return (
     <div>
-      <div style={{ border:"2px dashed var(--border)", background:"var(--ivoryD)", padding:"1.5rem", textAlign:"center", cursor:"pointer", maxWidth:220, margin:"0 auto" }}
-        onClick={() => ref.current.click()}>
+      <div style={{ border:"2px dashed var(--border)", background:"var(--ivoryD)", padding:"1.5rem", textAlign:"center", cursor:"pointer", maxWidth:220, margin:"0 auto", position:"relative" }}
+        onClick={() => !compressing && ref.current.click()}>
+        {compressing && (
+          <div style={{ position:"absolute", inset:0, background:"rgba(255,255,255,0.85)", display:"flex", alignItems:"center", justifyContent:"center", flexDirection:"column", fontSize:"0.78rem", color:"var(--crimson)", fontWeight:600 }}>
+            <div style={{ fontSize:"1.6rem", marginBottom:4 }}>⏳</div>
+            Processing...
+          </div>
+        )}
         {preview
           ? <img src={preview} alt="QR" style={{ width:150, height:150, objectFit:"contain" }}/>
           : <div style={{ color:"var(--muted)" }}>
@@ -1146,9 +1242,51 @@ function AdminOrders({ orders, saveOrders, toast }) {
 ═══════════════════════════════════════════ */
 function AdminSettings({ settings, saveSettings, products, toast }) {
   const [form, setForm] = useState({ ...SEED_SETTINGS, ...settings });
+  const [saving, setSaving] = useState(false);
+  const [catUploading, setCatUploading] = useState({}); // { Saree: true, ... }
   useEffect(()=>setForm({...SEED_SETTINGS,...settings}),[settings]);
   const set  = f=>e=>setForm(x=>({...x,[f]:e.target.value}));
-  const save = ()=>{ saveSettings(form); toast("Settings saved ✓"); };
+
+  const save = async ()=>{
+    // Guard: Firestore documents have a hard 1MB limit. Since all category
+    // images, the QR code, and the ad banner image live in this one
+    // "settings" document together, check the combined size before saving
+    // so we fail with a clear message instead of a silent/confusing error.
+    const approxSize = new Blob([JSON.stringify(form)]).size;
+    if (approxSize > 900 * 1024) {
+      toast(`❌ Too much image data (${Math.round(approxSize/1024)}KB). Remove or replace an image and try again.`);
+      return;
+    }
+
+    setSaving(true);
+    try {
+      await saveSettings(form);
+      toast("Settings saved ✓");
+    } catch (e) {
+      console.error("Settings save failed:", e);
+      toast("❌ Save failed — please check your connection and try again");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleCatImageUpload = (cat, file) => {
+    if (!file) return;
+    if (file.size > 5*1024*1024) { alert("Max 5MB"); return; }
+
+    setCatUploading(u=>({...u,[cat]:true}));
+    compressImage(file, { maxWidth: 500, maxHeight: 500, quality: 0.7 })
+      .then(compressed => {
+        setForm(f=>({...f, catImages:{...(f.catImages||{}), [cat]: compressed}}));
+      })
+      .catch(err => {
+        console.error("Category image compression failed:", err);
+        alert(`Could not process image for ${cat}. Please try a different photo.`);
+      })
+      .finally(() => {
+        setCatUploading(u=>({...u,[cat]:false}));
+      });
+  };
 
   const SH = ({children})=>(
     <h3 style={{ fontFamily:"'Cormorant Garamond',serif",fontSize:"1.1rem",color:"var(--crimson)",marginBottom:"1rem",paddingBottom:"0.5rem",borderBottom:"1px solid var(--border)" }}>{children}</h3>
@@ -1287,14 +1425,21 @@ function AdminSettings({ settings, saveSettings, products, toast }) {
         <div style={{ display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))",gap:"1rem" }}>
           {["Saree","Lehenga","Suit","Dupatta","Kurta"].map(cat=>{
             const current=form.catImages?.[cat]||null;
+            const isUploading = !!catUploading[cat];
             return (
               <div key={cat} style={{ border:"1px solid var(--border)",padding:"0.8rem",background:"var(--ivoryD)",textAlign:"center" }}>
                 <label className="form-label" style={{ marginBottom:"0.5rem" }}>{cat}</label>
                 <div style={{ position:"relative",width:100,height:100,margin:"0 auto 0.5rem" }}>
-                  <div onClick={()=>document.getElementById(`cat-img-${cat}`).click()}
-                    style={{ width:100,height:100,borderRadius:6,overflow:"hidden",border:"2px dashed var(--border)",background:"#fff",display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",transition:"border-color .2s" }}
-                    onMouseEnter={e=>e.currentTarget.style.borderColor="var(--gold)"}
+                  <div onClick={()=>!isUploading && document.getElementById(`cat-img-${cat}`).click()}
+                    style={{ width:100,height:100,borderRadius:6,overflow:"hidden",border:"2px dashed var(--border)",background:"#fff",display:"flex",alignItems:"center",justifyContent:"center",cursor:isUploading?"default":"pointer",transition:"border-color .2s",position:"relative" }}
+                    onMouseEnter={e=>!isUploading && (e.currentTarget.style.borderColor="var(--gold)")}
                     onMouseLeave={e=>e.currentTarget.style.borderColor="var(--border)"}>
+                    {isUploading && (
+                      <div style={{ position:"absolute", inset:0, background:"rgba(255,255,255,0.85)", display:"flex", alignItems:"center", justifyContent:"center", flexDirection:"column", zIndex:2, fontSize:"0.65rem", color:"var(--crimson)", fontWeight:600 }}>
+                        <div style={{ fontSize:"1.3rem", marginBottom:2 }}>⏳</div>
+                        Processing
+                      </div>
+                    )}
                     {current?<img src={current} alt={cat} style={{ width:"100%",height:"100%",objectFit:"cover" }}/>:
                       <div style={{ textAlign:"center",color:"var(--muted)",padding:"0.4rem" }}>
                         <div style={{ fontSize:"1.8rem",marginBottom:4 }}>📷</div>
@@ -1302,16 +1447,18 @@ function AdminSettings({ settings, saveSettings, products, toast }) {
                       </div>}
                   </div>
                   <input id={`cat-img-${cat}`} type="file" accept="image/*" style={{ display:"none" }}
-                    onChange={e=>{ const file=e.target.files[0]; if(!file) return; if(file.size>3*1024*1024){alert("Max 3MB");return;} const reader=new FileReader(); reader.onload=ev=>setForm(f=>({...f,catImages:{...(f.catImages||{}),[cat]:ev.target.result}})); reader.readAsDataURL(file); }}/>
+                    onChange={e=>{ const file=e.target.files[0]; handleCatImageUpload(cat, file); e.target.value=""; }}/>
                 </div>
-                {current&&<button onClick={()=>setForm(f=>({...f,catImages:{...(f.catImages||{}),[cat]:null}}))} style={{ background:"none",border:"1px solid #C62828",color:"#C62828",padding:"0.2rem 0.6rem",fontSize:"0.72rem",cursor:"pointer" }}>✕ Remove</button>}
+                {current&&!isUploading&&<button onClick={()=>setForm(f=>({...f,catImages:{...(f.catImages||{}),[cat]:null}}))} style={{ background:"none",border:"1px solid #C62828",color:"#C62828",padding:"0.2rem 0.6rem",fontSize:"0.72rem",cursor:"pointer" }}>✕ Remove</button>}
               </div>
             );
           })}
         </div>
       </div>
 
-      <button className="btn-gold btn-full" style={{ padding:"0.9rem" }} onClick={save}>💾 Save All Settings</button>
+      <button className="btn-gold btn-full" style={{ padding:"0.9rem" }} onClick={save} disabled={saving}>
+        {saving ? "💾 Saving..." : "💾 Save All Settings"}
+      </button>
     </div>
   );
 }
